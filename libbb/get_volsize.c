@@ -27,6 +27,7 @@ uoff_t FAST_FUNC get_volume_size_in_bytes(int fd,
 		// Seek past end fails on block devices but works on files!
 		if (lseek(fd, result - 1, SEEK_SET) != (off_t)-1) {
 			char dummy;
+//NB: here, fd needs a O_RDWR open, not O_WRONLY!
 			if (extend && safe_read(fd, &dummy, 1) != 1) {
 				// the file is shorter
 				xwrite(fd, "", 1); // grow it
