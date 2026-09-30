@@ -80,7 +80,8 @@
 //usage:       "[-C CYLINDERS] [-H HEADS] [-S SECTORS] [-b SSZ] [-t PARTTYPE] DISK"
 //usage:#define fdisk_full_usage "\n\n"
 //usage:	IF_FEATURE_FDISK_WRITABLE("Change")IF_NOT_FEATURE_FDISK_WRITABLE("Show")" partition table\n"
-//usage:     "\n	-u		Start and End are in sectors (instead of cylinders)"
+//usage:     "\n	-u		Start and End are in cylinders (instead of sectors)"
+//usage:     "\n			Also enable rounding of sizes to cylinders"
 //usage:     "\n	-l		Show partition table for each DISK and exit"
 //usage:	IF_FEATURE_FDISK_BLKSIZE(
 //usage:     "\n	-s		Show size in kb for each DISK and exit"
@@ -106,6 +107,12 @@
 #endif
 #if !defined(BLKGETSIZE64)
 # define BLKGETSIZE64 _IOR(0x12,114,size_t)
+#endif
+
+#if 0
+# define dbg(...) bb_error_msg(__VA_ARGS__)
+#else
+# define dbg(...) ((void)0)
 #endif
 
 /* Get device geometry in this struct: */
@@ -176,7 +183,12 @@ enum {
 };
 #define USER_SET_SECTOR_SIZE (option_mask32 & OPT_b)
 #define NOWARN_OPT_ls        (!ENABLE_FEATURE_FDISK_WRITABLE || (option_mask32 & (OPT_l|OPT_s)))
-#define DISPLAY_IN_CYL_UNITS (!(option_mask32 & OPT_u))
+// The meaning of -u was inverted in its meaning in util-linux by:
+//  commit 0b1f769f281ac2feb21b8a52af3fe999922c8833
+//  Date:   Tue Jun 15 13:13:05 2010 +0200
+//      fdisk: disable DOS mode and cylinders by default
+// Now it also takes an optional parameter, "cylinder[s]"/"sector[s]" (we don't do that):
+#define DISPLAY_IN_CYL_UNITS        (option_mask32 & OPT_u)
 #define TOGGLE_DISPLAY_IN_CYL_UNITS (option_mask32 ^= OPT_u)
 
 #define SUPPORT_DISKLABELS (0 \
@@ -404,8 +416,7 @@ struct globals {
 #if ENABLE_FEATURE_OSF_LABEL
 	smallint possibly_osf_label;
 #endif
-
-	smallint dos_compatible_flag; // = 1;
+	smallint dos_compatible_flag;
 #if ENABLE_FEATURE_OSF_LABEL
 # if !defined(__alpha__)
 	struct dos_partition *xbsd_part;
@@ -468,7 +479,8 @@ struct globals {
 	offset_after_MBR_and_ext = 1; \
 	g_partitions = 4; \
 	units_per_sector = 1; \
-	dos_compatible_flag = 1; \
+	/* off by default in util-linux 2.41.1: */ \
+	/* dos_compatible_flag = 1; */ \
 } while (0)
 
 /* TODO: move to libbb? */
@@ -1003,7 +1015,7 @@ read_extended_chain(int ext)
 						" %u\n", "link", g_partitions + 1);
 				else
 					pe->ext_pointer = p;
-			} else if (p->sys_ind != 0) {
+			} else if (!is_cleared_partition(p)) {
 				if (pe->part_table)
 					printf("Warning: extra %s "
 						"pointer in ext.partition chain"
@@ -1036,17 +1048,19 @@ read_extended_chain(int ext)
 	}
 
 #if ENABLE_FEATURE_FDISK_WRITABLE
-	/* remove empty links */
+	// Remove empty data partitions in extended chain
  remove:
 	for (i = 4; i < g_partitions; i++) {
 		struct pte *pe = &ptes[i];
-
-		if (!get_nr_sects(pe->part_table)
-		 && (g_partitions > 5 || ptes[4].part_table->sys_ind)
-		) {
-			printf("Omitting empty partition (%u)\n", i+1);
-			delete_partition(i);
-			goto remove;    /* numbering changed */
+		if (get_nr_sects(pe->part_table) == 0) {
+			if (g_partitions == 5 && is_cleared_partition(pe->part_table)) {
+				// empty extended partition
+				// (need to keep it for its sector buffer?)
+			} else {
+				printf("Omitting empty partition (%u)\n", i + 1);
+				delete_partition(i);
+				goto remove;    // numbering changed
+			}
 		}
 	}
 #endif
@@ -1114,9 +1128,9 @@ get_partition_table_geometry(void)
 	hh = ss = 0;
 	for (i = 0; i < 4; i++) {
 		p = pt_offset(bufp, i);
-		if (p->sys_ind != 0) {
+		if (!is_cleared_partition(p)) {
 			h = p->end_head + 1;
-			s = (p->end_sector & 077);
+			s = (p->end_sector & 0x3f);
 			if (first) {
 				hh = h;
 				ss = s;
@@ -1316,14 +1330,18 @@ static sector_t
 read_int(sector_t low, sector_t dflt, sector_t high, sector_t base, const char *mesg)
 {
 	sector_t value;
-	int default_ok = 1;
-	const char *fmt = "%s (%u-%u, default %u): ";
+	int default_ok;
+	const char *fmt;
 
+	if (low == high) // no need to ask
+		return low;
+
+	default_ok = 1;
+	fmt = "%s (%u-%u, default %u): ";
 	if (dflt < low || dflt > high) {
 		fmt = "%s (%u-%u): ";
 		default_ok = 0;
 	}
-
 	while (1) {
 		int use_default = default_ok;
 
@@ -1432,7 +1450,7 @@ input_partition_number(int warn, unsigned max)
 
 	if (warn) {
 		if (pe->part_table->sys_ind == 0) {
-			printf("Warning: partition %u has type 0\n", i+1);
+			printf("Warning: partition %u has type 0\n", i + 1);
 		}
 	}
 	return i;
@@ -1466,7 +1484,7 @@ get_existing_partition(int warn, unsigned max)
 }
 
 static int
-find_free_primary_partition(void)
+choose_free_primary_partition(void)
 {
 	int pno = -1;
 	unsigned i;
@@ -1493,7 +1511,6 @@ find_free_primary_partition(void)
 	return input_partition_number(/*warn*/ 0, 4);
 }
 
-
 static void
 change_units(void)
 {
@@ -1519,13 +1536,8 @@ static void
 toggle_dos_compatibility_flag(void)
 {
 	dos_compatible_flag = 1 - dos_compatible_flag;
-	if (dos_compatible_flag) {
-		offset_after_MBR_and_ext = g_sectors;
-		printf("DOS Compatibility flag (%u sector gap) is %sset\n", offset_after_MBR_and_ext, "");
-	} else {
-		offset_after_MBR_and_ext = 1;
-		printf("DOS Compatibility flag (%u sector gap) is %sset\n", offset_after_MBR_and_ext, "not ");
-	}
+	offset_after_MBR_and_ext = dos_compatible_flag ? g_sectors : 1;
+	printf("DOS Compatibility flag is %sset (sector gap:%d)\n", "", offset_after_MBR_and_ext);
 }
 
 static void
@@ -1553,7 +1565,7 @@ delete_partition(int i)
 		return;
 	}
 
-	if (!q->sys_ind && i > 4) {
+	if (is_cleared_partition(q) && i > 4) {
 		/* the last one in the chain - just delete */
 		--g_partitions;
 		--i;
@@ -1607,7 +1619,7 @@ change_sysid(void)
 
 	/* if changing types T to 0 is allowed, then
 	   the reverse change must be allowed, too */
-	if (sys == 0 && !get_nr_sects(p))	{
+	if (sys == 0 && get_nr_sects(p) == 0) {
 		printf("Partition %u does not exist yet\n", i + 1);
 		return;
 	}
@@ -1723,15 +1735,13 @@ wrong_p_order(int *prev)
 		}
 		pe = &ptes[i];
 		p = pe->part_table;
-		if (p->sys_ind) {
+		if (!is_cleared_partition(p)) {
 			p_start_pos = get_partition_start_from_dev_start(pe);
-
 			if (last_p_start_pos > p_start_pos) {
 				if (prev)
 					*prev = last_i;
 				return i;
 			}
-
 			last_p_start_pos = p_start_pos;
 			last_i = i;
 		}
@@ -1950,7 +1960,7 @@ x_dos_print_disklabel(int extend)
 				get_nr_sects(p),
 				p->sys_ind
 			);
-			if (p->sys_ind)
+			if (!is_cleared_partition(p))
 				check_consistency(p, i);
 		}
 	}
@@ -2155,7 +2165,7 @@ fill_bounds(sector_t *first, sector_t *last)
 
 	for (i = 0; i < g_partitions; pe++,i++) {
 		p = pe->part_table;
-		if (!p->sys_ind || IS_EXTENDED(p->sys_ind)) {
+		if (is_cleared_partition(p) || IS_EXTENDED(p->sys_ind)) {
 			first[i] = 0xffffffff;
 			last[i] = 0;
 		} else {
@@ -2206,7 +2216,8 @@ verify(void)
 		struct pte *pe = &ptes[i];
 
 		p = pe->part_table;
-		if (p->sys_ind && !IS_EXTENDED(p->sys_ind)) {
+//TODO: warn about EXTENDED partitions with nr_sect==0? Kernel will ignore these (requires at least 1)
+		if (!is_cleared_partition(p) && !IS_EXTENDED(p->sys_ind)) {
 			check_consistency(p, i);
 			if (get_partition_start_from_dev_start(pe) < first[i])
 				printf("Warning: bad start-of-data in "
@@ -2236,7 +2247,7 @@ verify(void)
 		for (i = 4; i < g_partitions; i++) {
 			total++;
 			p = ptes[i].part_table;
-			if (!p->sys_ind) {
+			if (is_cleared_partition(p)) {
 				if (i != 4 || i + 1 < g_partitions)
 					printf("Warning: partition %u "
 						"is empty\n", i + 1);
@@ -2264,13 +2275,14 @@ static void
 set_hsc_start_end(struct dos_partition *p, sector_t start, sector_t stop)
 {
 #define SET_HEAD_SECT_CYL(h, s, c, sector) do { \
-	s = sector % g_sectors + 1;  \
-	sector /= g_sectors;         \
-	h = sector % g_heads;        \
-	sector /= g_heads;           \
-	c = sector & 0xff;           \
-	s |= (sector >> 2) & 0xc0;   \
-} while (0)
+		s = sector % g_sectors + 1;  \
+		sector /= g_sectors;         \
+		h = sector % g_heads;        \
+		sector /= g_heads;           \
+		c = sector & 0xff;           \
+		s |= (sector >> 2) & 0xc0;   \
+	} while (0)
+
 	if (dos_compatible_flag && (start / (g_sectors * g_heads) > 1023))
 		start = g_heads * g_sectors * 1024 - 1;
 	SET_HEAD_SECT_CYL(p->head, p->sector, p->cyl, start);
@@ -2306,31 +2318,37 @@ add_partition(int n, int sys)
 {
 	char mesg[64];
 	int i, num_read;
-	struct dos_partition *p = ptes[n].part_table;
-	struct dos_partition *q = ptes[ext_index].part_table;
+	struct dos_partition *p;
+	struct dos_partition *main_ext;
 	sector_t limit, temp;
 	sector_t start, stop;
 	sector_t first[g_partitions], last[g_partitions];
 
-	if (p && p->sys_ind) {
+	p = ptes[n].part_table;
+	if (p && !is_cleared_partition(p)) {
 		printf("Partition %u is already defined, delete it before re-adding\n", n + 1);
 		return;
 	}
 	fill_bounds(first, last);
+	main_ext = ptes[ext_index].part_table;
 	if (n < 4) {
 		start = offset_after_MBR_and_ext;
-		if (DISPLAY_IN_CYL_UNITS || !total_number_of_sectors)
+		if (DISPLAY_IN_CYL_UNITS || !total_number_of_sectors) {
 			limit = (sector_t) g_heads * g_sectors * g_cylinders - 1;
-		else
+			dbg("%d: limit:%d", __LINE__, limit);
+		} else {
 			limit = total_number_of_sectors - 1;
+			dbg("%d: limit:%d", __LINE__, limit);
+		}
 		if (extended_offset) {
 			first[ext_index] = extended_offset;
-			last[ext_index] = get_start_sect(q) +
-				get_nr_sects(q) - 1;
+			last[ext_index] = extended_offset + get_nr_sects(main_ext) - 1;
 		}
+		dbg("%d: start:%d limit:%d", __LINE__, start, limit);
 	} else {
 		start = extended_offset + offset_after_MBR_and_ext;
-		limit = get_start_sect(q) + get_nr_sects(q) - 1;
+		limit = extended_offset + get_nr_sects(main_ext) - 1;
+		dbg("%d: start:%d limit:%d", __LINE__, start, limit);
 	}
 	if (DISPLAY_IN_CYL_UNITS)
 		for (i = 0; i < g_partitions; i++)
@@ -2341,13 +2359,17 @@ add_partition(int n, int sys)
 	do {
 		temp = start;
 		for (i = 0; i < g_partitions; i++) {
-			int lastplusoff;
+			sector_t lastplusoff;
 
-			if (start == ptes[i].offset_from_dev_start)
+			if (start == ptes[i].offset_from_dev_start) {
 				start += offset_after_MBR_and_ext;
+				dbg("%d: start:%d", __LINE__, start);
+			}
 			lastplusoff = last[i] + ((n < 4) ? 0 : offset_after_MBR_and_ext);
-			if (start >= first[i] && start <= lastplusoff)
+			if (start >= first[i] && start <= lastplusoff) {
 				start = lastplusoff + 1;
+				dbg("%d: start:%d", __LINE__, start);
+			}
 		}
 		if (start > limit)
 			break;
@@ -2363,8 +2385,11 @@ add_partition(int n, int sys)
 			start = read_int(cround(saved_start), cround(saved_start), cround(limit), 0, mesg);
 			if (DISPLAY_IN_CYL_UNITS) {
 				start = (start - 1) * units_per_sector;
-				if (start < saved_start)
+				dbg("%d: start:%d", __LINE__, start);
+				if (start < saved_start) {
 					start = saved_start;
+					dbg("%d: start:%d", __LINE__, start);
+				}
 			}
 			num_read = 1;
 		}
@@ -2376,18 +2401,24 @@ add_partition(int n, int sys)
 		pe->offset_from_dev_start = start - offset_after_MBR_and_ext;
 		if (pe->offset_from_dev_start == extended_offset) { /* must be corrected */
 			pe->offset_from_dev_start++;
-			if (offset_after_MBR_and_ext == 1)
+			if (offset_after_MBR_and_ext == 1) {
 				start++;
+				dbg("%d: ++start:%d", __LINE__, start);
+			}
 		}
 	}
 
 	for (i = 0; i < g_partitions; i++) {
 		struct pte *pe = &ptes[i];
 
-		if (start < pe->offset_from_dev_start && limit >= pe->offset_from_dev_start)
+		if (start < pe->offset_from_dev_start && limit >= pe->offset_from_dev_start) {
 			limit = pe->offset_from_dev_start - 1;
-		if (start < first[i] && limit >= first[i])
+			dbg("%d: limit:%d", __LINE__, limit);
+		}
+		if (start < first[i] && limit >= first[i]) {
 			limit = first[i] - 1;
+			dbg("%d: limit:%d", __LINE__, limit);
+		}
 	}
 	if (start > limit) {
 		puts("No free sectors available");
@@ -2432,7 +2463,7 @@ add_partition(int n, int sys)
 static void
 add_logical(void)
 {
-	if (g_partitions > 5 || ptes[4].part_table->sys_ind) {
+	if (g_partitions > 5 || !is_cleared_partition(ptes[4].part_table)) {
 		struct pte *pe = &ptes[g_partitions];
 
 		pe->sectorbuffer = xzalloc(sector_size);
@@ -2490,7 +2521,7 @@ new_partition(void)
 	if (c == 'p'
 	 || (c == 'e' && !extended_offset)
 	) {
-		free_primary = find_free_primary_partition();
+		free_primary = choose_free_primary_partition();
 		//if (free_primary >= 0) // cannot fail, we know it exists
 		add_partition(free_primary, c == 'p' ? LINUX_NATIVE : EXTENDED);
 		return;
@@ -2588,11 +2619,11 @@ move_begin(unsigned i)
 	if (warn_geometry())
 		return;
 	nr_sects = get_nr_sects(p);
-	if (!p->sys_ind || !nr_sects || IS_EXTENDED(p->sys_ind)) {
+	if (nr_sects == 0 || IS_EXTENDED(p->sys_ind)) {
 		printf("Partition %u has no data area\n", i + 1);
 		return;
 	}
-	first = get_partition_start_from_dev_start(pe); /* == pe->offset_from_dev_start + get_start_sect(p) */
+	first = get_partition_start_from_dev_start(pe); // pe->offset_from_dev_start + get_start_sect(p)
 	new = read_int(0 /*was:first*/, first, first + nr_sects - 1, first, "New beginning of data");
 	if (new != first) {
 		sector_t new_relative = new - pe->offset_from_dev_start;
@@ -2632,7 +2663,7 @@ menu(void)
 		puts("q\tquit without saving changes");
 		//deleted: puts("s\tcreate a new empty Sun disklabel");  /* sun */
 		puts("t\tchange a partition's system id");
-		puts("u\tchange display/entry units");
+		printf("u\tchange display/entry units to %ss\n", DISPLAY_IN_CYL_UNITS ? "sector" : "cylinder");
 		puts("v\tverify partition table");
 		puts("w\twrite table to disk and exit");
 # if ENABLE_FEATURE_FDISK_ADVANCED
