@@ -338,6 +338,7 @@ static const int32_t mount_options[] ALIGN4 = {
 	IF_FEATURE_MOUNT_FSTAB(
 		/* "defaults" */ 0,
 		/* "quiet" 0 - do not filter out, vfat wants to see it */
+		/* "auto" */   ~MOUNT_NOAUTO,
 		/* "noauto" */ MOUNT_NOAUTO,
 		IF_DESKTOP(/* "user"  */ MOUNT_USERS,)
 		IF_DESKTOP(/* "users" */ MOUNT_USERS,)
@@ -400,6 +401,7 @@ static const char mount_option_str[] ALIGN1 =
 		"defaults\0"
 		// "quiet\0" - do not filter out, vfat wants to see it
 		// "swap\0" - WRONG, fstab uses "swap" _fstype_, not _option_, to indicate a swap partition
+		"auto\0"
 		"noauto\0"
 		IF_DESKTOP("user\0")
 		IF_DESKTOP("users\0")
@@ -2111,7 +2113,7 @@ static int singlemount(struct mntent *mp, int ignore_busy)
 	// a synthetic filesystem like proc or sysfs.)
 	// (We use stat, not lstat, in order to allow
 	// mount symlink_to_file_or_blkdev dir)
-	if (!stat(mp->mnt_fsname, &st)
+	if (stat(mp->mnt_fsname, &st) == 0
 	 && !(vfsflags & (MS_REMOUNT | MS_BIND | MS_MOVE))
 	) {
 		// Do we need to allocate a loopback device for it?
@@ -2143,15 +2145,13 @@ static int singlemount(struct mntent *mp, int ignore_busy)
 			if (loopfd < 0) {
 				if (errno == EPERM || errno == EACCES)
 					bb_simple_error_msg(bb_msg_perm_denied_are_you_root);
-				else
+				else if (loopfd == -1)
 					bb_simple_perror_msg("can't setup loop device");
+				else
+					bb_simple_perror_msg(loopFile);
 				return loopfd; // was "return errno", but it can be 0 here
 			}
-
-		// Autodetect bind mounts
-//FIXME: not compatible with util-linux?
-		} else if (S_ISDIR(st.st_mode) && !mp->mnt_type)
-			vfsflags |= MS_BIND;
+		}
 	}
 
 	// If we know the fstype (or don't need to), jump straight
