@@ -1607,6 +1607,7 @@ void bb_perror_nomsg_and_die(void) NORETURN FAST_FUNC;
 void bb_perror_nomsg(void) FAST_FUNC;
 void bb_verror_msg(const char *s, va_list p, const char *strerr) FAST_FUNC;
 void bb_die_memory_exhausted(void) NORETURN FAST_FUNC;
+void bb_die_corrupted_data(void) NORETURN FAST_FUNC;
 void bb_logenv_override(void) FAST_FUNC;
 
 /* x86 benefits from narrow exit code variables
@@ -1763,6 +1764,7 @@ const struct hwtype *get_hwntype(int type) FAST_FUNC;
 
 
 extern int fstype_matches(const char *fstype, const char *comma_list) FAST_FUNC;
+extern int fsopts_matches(const char *fsopts, const char *comma_list) FAST_FUNC;
 #ifdef HAVE_MNTENT_H
 extern struct mntent *find_mount_point(const char *name, int subdir_too) FAST_FUNC;
 #endif
