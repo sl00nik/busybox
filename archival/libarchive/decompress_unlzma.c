@@ -17,7 +17,6 @@
 # define dbg(...) ((void)0)
 #endif
 
-
 #if ENABLE_FEATURE_LZMA_FAST
 #  define speed_inline ALWAYS_INLINE
 #  define size_inline
@@ -25,7 +24,6 @@
 #  define speed_inline
 #  define size_inline ALWAYS_INLINE
 #endif
-
 
 typedef struct {
 	int fd;
@@ -50,7 +48,6 @@ typedef struct {
 #define RC_TOP_BITS 24
 #define RC_MOVE_BITS 5
 #define RC_MODEL_TOTAL_BITS 11
-
 
 /* Called once in rc_do_normalize() */
 static void rc_read(rc_t *rc)
@@ -151,14 +148,6 @@ rc_bit_tree_decode(rc_t *rc, uint16_t *p, int num_levels, int *symbol)
 	*symbol -= 1 << num_levels;
 }
 
-
-typedef struct {
-	uint8_t pos;
-	uint32_t dict_size;
-	uint64_t dst_size;
-} PACKED lzma_header_t;
-
-
 /* #defines will force compiler to compute/optimize each one with each usage.
  * Have heart and use enum instead. */
 enum {
@@ -211,13 +200,20 @@ enum {
 	LZMA_LITERAL        = (LZMA_REP_LEN_CODER + LZMA_NUM_LEN_PROBS),
 };
 
-
 IF_DESKTOP(long long) int FAST_FUNC
 unpack_lzma_stream(transformer_state_t *xstate)
 {
+	typedef struct {
+		uint8_t  properties;
+		uint32_t dict_size;
+		uint64_t dst_size;
+	} PACKED lzma_header_t;
+
 	IF_DESKTOP(long long total_written = 0;)
 	lzma_header_t header;
-	int lc, pb, lp;
+	unsigned lc; // number of literal context bits, 0..8
+	unsigned pb; // number of position bits, 0..4
+	unsigned lp; // number of literal position bits, 0..4
 	uint32_t pos_state_mask;
 	uint32_t literal_pos_mask;
 	uint16_t *p;
@@ -226,36 +222,57 @@ unpack_lzma_stream(transformer_state_t *xstate)
 	uint8_t *buffer;
 	uint32_t buffer_size;
 	uint8_t previous_byte = 0;
-	size_t buffer_pos = 0, global_pos = 0;
+	size_t buffer_pos;
+	size_t global_pos;
 	int len = 0;
 	int state = 0;
 	uint32_t rep0 = 1, rep1 = 1, rep2 = 1, rep3 = 1;
 
 	if (full_read(xstate->src_fd, &header, sizeof(header)) != sizeof(header)
-	 || header.pos >= (9 * 5 * 5)
+	 || header.properties > (4 * 5 + 4) * 9 + 8
 	) {
+ bad_header:
 		bb_simple_error_msg("bad lzma header");
 		return -1;
 	}
+	// properties = (pb * 5 + lp) * 9 + lc, pb<=4, lp<=4, lc<=8
+	i = header.properties / 9;
+	lc = header.properties % 9;
+	pb = (unsigned)i / 5;
+	lp = (unsigned)i % 5;
+	pos_state_mask = (1 << pb) - 1;   // max 00001111
+	literal_pos_mask = (1 << lp) - 1; // max 00001111
 
-	i = header.pos / 9;
-	lc = header.pos % 9;
-	pb = i / 5;
-	lp = i % 5;
-	pos_state_mask = (1 << pb) - 1;
-	literal_pos_mask = (1 << lp) - 1;
-
-	/* Example values from linux-3.3.4.tar.lzma:
-	 * dict_size: 64M, dst_size: 2^64-1
-	 */
+	// Example values from linux-3.3.4.tar.lzma:
+	// dict_size: 64M, dst_size: 2^64-1
 	header.dict_size = SWAP_LE32(header.dict_size);
-	header.dst_size = SWAP_LE64(header.dst_size);
+	if (header.dict_size == 0
+	 || header.dict_size > 1024*1024*1024 / 2 * 3 // 1.5GB upper limit mentioned in "man xz"
+	 || (header.dict_size & 0xff) // code expects dict_size to be reasonably round, let's require 256 bytes
+	// xz --format=lzma --lzma1=dict=SIZE requires 4K minimum, rounds dict_size up to be 2^N or 2^N+2^(N-1)
+	) {
+		//bb_error_msg("header.dict_size:0x%08x", header.dict_size);
+		goto bad_header;
+	}
+	//UNUSED:header.dst_size = SWAP_LE64(header.dst_size);
+	// Note that these values within header are misaligned!
+	// I discovered that gcc _intentionally shifts_ "header" variable on stack to fix this (!)
 
-	if (header.dict_size == 0)
-		header.dict_size++;
-
-	buffer_size = MIN(header.dst_size, header.dict_size);
+	// Used to do this:
+	//buffer_size = MIN(header.dst_size, header.dict_size);
+//#define BUFSIZE_CAN_BE_LESS_THAN_DICTSIZE 1
+	// but this requires extra "pos > buffer_size" checks
+	// after each "if (pos < 0) pos += header.dict_size".
+	// Considering that normally dict_size <= dst_size (uncompressed size)
+	// and therefore we _have to_ allocate full buffer in most cases,
+	// and that large malloc is mmap()ed and allocated _on demand_,
+	// let's just use a larger dict_size allocation:
+	buffer_size = header.dict_size;
 	buffer = xmalloc(buffer_size);
+#define BUFSIZE_CAN_BE_LESS_THAN_DICTSIZE 0
+
+	// Does not show any speedup in my testing (be sure to convert to mmap if you try this):
+	//madvise(buffer, buffer_size, MADV_HUGEPAGE);
 
 	{
 		int num_probs;
@@ -269,7 +286,15 @@ unpack_lzma_stream(transformer_state_t *xstate)
 
 	rc = rc_init(xstate->src_fd); /*, RC_BUFFER_SIZE); */
 
-	while (global_pos + buffer_pos < header.dst_size) {
+	buffer_pos = 0;
+	// Since global_pos is ever only used for masking off pos_state_mask / literal_pos_mask bits,
+	// it is only advanced by += header.dict_size, and since dict_size is round to at least 256 bytes,
+	// the variable is actually not necessary:
+	global_pos = 0;
+	// Optimize its updates out (compiler will eliminate variable entirely):
+#define ADVANCE_global_pos_by_dict_size() ((void)0) /*global_pos += header.dict_size*/
+
+	while (1) {
 		int pos_state = (buffer_pos + global_pos) & pos_state_mask;
 		uint16_t *prob = p + LZMA_IS_MATCH + (state << LZMA_NUM_POS_BITS_MAX) + pos_state;
 
@@ -294,6 +319,9 @@ unpack_lzma_stream(transformer_state_t *xstate)
 					pos += header.dict_size;
 					if ((int32_t)pos < 0)
 						goto bad;
+# if BUFSIZE_CAN_BE_LESS_THAN_DICTSIZE
+					//instead of the above: if (pos >= buffer_size) goto bad;
+#endif
 				}
 				match_byte = buffer[pos];
 				do {
@@ -318,7 +346,7 @@ unpack_lzma_stream(transformer_state_t *xstate)
 			buffer[buffer_pos++] = previous_byte;
 			if (buffer_pos == header.dict_size) {
 				buffer_pos = 0;
-				global_pos += header.dict_size;
+				ADVANCE_global_pos_by_dict_size();
 				if (transformer_write(xstate, buffer, header.dict_size) != (ssize_t)header.dict_size)
 					goto bad;
 				IF_DESKTOP(total_written += header.dict_size;)
@@ -356,10 +384,15 @@ unpack_lzma_stream(transformer_state_t *xstate)
 						if ((int32_t)pos < 0) {
 							pos += header.dict_size;
 							/* see unzip_bad_lzma_2.zip: */
+# if BUFSIZE_CAN_BE_LESS_THAN_DICTSIZE
 							if (pos >= buffer_size) {
 								dbg("%d pos:%d buffer_size:%d", __LINE__, pos, buffer_size);
 								goto bad;
 							}
+# else
+							if ((int32_t)pos < 0)
+								goto bad;
+# endif
 						}
 						previous_byte = buffer[pos];
 						goto one_byte1;
@@ -451,6 +484,7 @@ unpack_lzma_stream(transformer_state_t *xstate)
 				rep0++;
 				if ((int32_t)rep0 <= 0) {
 					if (rep0 == 0)
+// this is where main decompression loop exits:
 						break;
 					dbg("%d rep0:%d", __LINE__, rep0);
 					goto bad;
@@ -482,29 +516,34 @@ unpack_lzma_stream(transformer_state_t *xstate)
 					//if ((int32_t)pos < 0)
 					//	goto bad;
 					/* more stringent test (see unzip_bad_lzma_1.zip): */
+# if BUFSIZE_CAN_BE_LESS_THAN_DICTSIZE
 					if (pos >= buffer_size)
 						goto bad;
+# else
+					if ((int32_t)pos < 0)
+						goto bad;
+# endif
 				}
 				previous_byte = buffer[pos];
  IF_NOT_FEATURE_LZMA_FAST(one_byte2:)
 				buffer[buffer_pos++] = previous_byte;
 				if (buffer_pos == header.dict_size) {
 					buffer_pos = 0;
-					global_pos += header.dict_size;
+					ADVANCE_global_pos_by_dict_size();
 					if (transformer_write(xstate, buffer, header.dict_size) != (ssize_t)header.dict_size)
 						goto bad;
 					IF_DESKTOP(total_written += header.dict_size;)
 				}
 				len--;
-			} while (len != 0 && buffer_pos < header.dst_size);
+			} while (len != 0 /*&& buffer_pos < header.dst_size*/);
 			/* FIXME: ...........^^^^^
 			 * shouldn't it be "global_pos + buffer_pos < header.dst_size"?
 			 * It probably should, but it is a "do we accidentally
 			 * unpack more bytes than expected?" check - which
 			 * never happens for well-formed compression data...
 			 */
-		}
-	}
+		} /* else */
+	} /* while */
 
 	{
 		IF_NOT_DESKTOP(int total_written = 0; /* success */)
